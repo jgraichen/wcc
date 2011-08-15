@@ -11,6 +11,7 @@ require 'logger'
 require 'iconv'
 require 'base64'
 require 'yaml'
+require 'tempfile'
 
 # ruby gem dependencies
 require 'rubygems'
@@ -231,7 +232,7 @@ class SmtpMailer
 	def send(mail, from, to = [])
 		Net::SMTP.start(@host, @port) do |smtp|
 			to.each do |toaddr|
-				msg  = "From: #{from}\n"
+				msg  = "From: #{from.name} <#{from.address}>\n"
 				msg += "To: #{toaddr}\n"
 				msg += "Subject: #{mail.title.gsub(/\s+/, ' ')}\n"
 				msg += "Content-Type: text/plain; charset=\"utf-8\"\n"
@@ -239,7 +240,7 @@ class SmtpMailer
 				msg += "\n"
 				msg += Base64.encode64(mail.text)
 				
-				smtp.send_message msg, from.address, toaddr.address
+				smtp.send_message(msg, from.address, toaddr.address)
 			end
 		end
 	rescue
@@ -262,8 +263,11 @@ class MailAddress
 	end
 
 	def address
-		return @email.match(/<([^>]+@[^@>]+)>/)[1] if @email =~ /^[\w\s]+<.+@[^@]+>$/
-		@email
+		if @email =~ /^[\w\s]+<.+@[^@]+>$/
+			@email.match(/<([^>]+@[^@>]+)>/)[1]
+		else
+			@email
+		end
 	end
 	
 	def to_s; @email end
@@ -329,7 +333,7 @@ def checkForUpdate(site)
 		site.hash, site.content = new_hash, new_site
 		
 		# diff between OLD and NEW
-		diff = %x[diff -U 1 --label "#{old_label}" --label "#{new_label}" #{old_site_file} #{Conf.file(site.id + '.site')}]
+		diff = %x[diff -U 1 --label "#{old_label}" --label "#{new_label}" #{old_site_file.path} #{Conf.file(site.id + '.site')}]
 	end
 	
 	Mail.new(
