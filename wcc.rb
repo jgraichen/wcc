@@ -36,8 +36,11 @@ class Conf
 			:debug => false,
 			:simulate => false,
 			:clean => false,
+			:nomails => false,
 			:dir => '/var/tmp/wcc',
 			:tag => 'wcc',
+			:syslog => false,
+			:filterd => './filter.d',
 			:mailer => 'smtp',
 			:smtp_host => 'localhost',
 			:smtp_port => 25
@@ -88,8 +91,10 @@ class Conf
 		yaml = YAML.load_file(self[:conf])
 		if yaml.is_a?(Hash) and (yaml = yaml['conf']).is_a?(Hash)
 			@options[:from_mail] ||= yaml['from_addr']
-			@options[:dir] ||= yaml['dir']
+			@options[:dir] ||= yaml['cache_dir']
 			@options[:tag] ||= yaml['tag']
+			@options[:syslog] ||= yaml['use_syslog']
+			@options[:filterd] ||= yaml['filterd']
 			
 			if yaml['email'].is_a?(Hash)
 				if yaml['email']['smtp'].is_a?(Hash)
@@ -122,6 +127,9 @@ class Conf
 				File.delete(self.file(f)) if f =~ /^.*\.(md5|site)$/
 			end
 		end
+		
+		# read filter.d
+		Dir[File.join(self[:filterd], '*.rb')].each { |file| require file }
 	end
 	
 	def self.sites
@@ -138,7 +146,8 @@ class Conf
 			@sites << Site.new(
 				yaml_site['url'], 
 				yaml_site['strip_html'] || false, 
-				yaml_site['emails'].map { |m| MailAddress.new(m) } || [])
+				yaml_site['emails'].map { |m| MailAddress.new(m) } || [],
+				(yaml_site['filters'] || []).map { |f| f.to_sym })
 		end if yaml
 		
 		$logger.debug @sites.length.to_s + (@sites.length == 1 ? ' site' : ' sites') + " loaded\n" +
@@ -164,10 +173,11 @@ class Conf
 end
 
 class Site
-	def initialize(url, strip_html, emails)
+	def initialize(url, strip_html, emails, filters)
 		@uri = URI.parse(url)
 		@striphtml = strip_html
 		@emails = emails.is_a?(Array) ? emails : [emails]
+		@filters = filters.is_a?(Array) ? filters : [filters]
 		@id = Digest::MD5.hexdigest(url.to_s)[0...8]
 		load_hash
 	end
@@ -175,6 +185,7 @@ class Site
 	def uri; @uri end
 	def striphtml?; @striphtml end
 	def emails; @emails end
+	def filters; @filters end
 	def id; @id end
 	
 	def to_s; "%s;%s;%s" % [@uri.to_s, (@striphtml ? 'yes' : 'no'), @emails.join(';')] end
@@ -210,6 +221,31 @@ class Site
 	end
 end
 
+class MailAddress
+	def initialize(email)
+		email = email.to_s if email.is_a?(MailAddress)
+		@email = email.strip
+	end
+	
+	def name
+		if @email =~ /^[\w\s]+<.+@[^@]+>$/
+			@email.gsub(/<.+?>/, '').strip
+		else
+			@email.split("@")[0...-1].join("@")
+		end
+	end
+
+	def address
+		if @email =~ /^[\w\s]+<.+@[^@]+>$/
+			@email.match(/<([^>]+@[^@>]+)>/)[1]
+		else
+			@email
+		end
+	end
+	
+	def to_s; @email end
+end
+
 class Mail
 	def initialize(title, message, options = {})
 		@title = title
@@ -232,7 +268,7 @@ class SmtpMailer
 	def send(mail, from, to = [])
 		Net::SMTP.start(@host, @port) do |smtp|
 			to.each do |toaddr|
-				msg  = "From: #{from}\n"
+				msg  = "From: #{from.name} <#{from.address}>\n"
 				msg += "To: #{toaddr}\n"
 				msg += "Subject: #{mail.title.gsub(/\s+/, ' ')}\n"
 				msg += "Content-Type: text/plain; charset=\"utf-8\"\n"
@@ -240,7 +276,7 @@ class SmtpMailer
 				msg += "\n"
 				msg += Base64.encode64(mail.text)
 				
-				smtp.send_message msg, from.address, toaddr.address
+				smtp.send_message(msg, from.address, toaddr.address)
 			end
 		end
 	rescue
@@ -248,26 +284,24 @@ class SmtpMailer
 	end
 end
 
-class MailAddress
-	def initialize(email)
-		email = email.to_s if email.is_a?(MailAddress)
-		@email = email.strip
+class Filter
+	@@filters = {}
+	
+	def self.add(id, &block)
+		$logger.info "Adding filter '#{id}'"
+		@@filters[id] = block
 	end
 	
-	def name
-		if @email =~ /^[\w\s]+<.+@[^@]+>$/
-			@email.gsub(/<.+?>/, '').strip
-		else
-			@email.split("@")[0...-1].join("@")
+	def self.accept(data, filters)
+		$logger.info "Testing with filters: #{filters.join(', ')}"
+		@@filters.select { |id,block| filters.include?(id) }.each do |id,block|
+			if not block.call(data):
+				$logger.info "Filter #{id} failed!"
+				return false
+			end
 		end
+		true
 	end
-
-	def address
-		return @email.match(/<([^>]+@[^@>]+)>/)[1] if @email =~ /^[\w\s]+<.+@[^@]+>$/
-		@email
-	end
-	
-	def to_s; @email end
 end
 
 class String
@@ -334,12 +368,14 @@ def checkForUpdate(site)
 		diff = %x[diff -U 1 --label "#{old_label}" --label "#{new_label}" #{old_site_file.path} #{Conf.file(site.id + '.site')}]
 	end
 	
+	return false if not Filter.accept(diff, site.filters)
+	
 	Mail.new(
 		"[#{Conf[:tag]}] #{site.uri.host} changed",
 		"Change at #{site.uri.to_s} - diff follows:\n\n#{diff}"
 		).send(site.emails) if Conf.send_mails?
 	
-	system("logger -t '#{Conf[:tag]}' 'Change at #{site.uri.to_s} (tag #{site.id}) detected'")
+	system("logger -t '#{Conf[:tag]}' 'Change at #{site.uri.to_s} (tag #{site.id}) detected'") if Conf[:syslog]
 	
 	true
 end
