@@ -19,3 +19,11 @@ sites:
       - mail2@example.com
     filters:
       - test
+      - paramtest: {number: 5}
+  - url: https://my.secret.place/
+    emails:
+      - me@secret.place
+    auth: {type: basic, username: me, password: secret}
+  - url: http://your.cms.com/
+    #emails: ...
+    cookie: file.cookie

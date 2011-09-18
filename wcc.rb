@@ -5,6 +5,7 @@ require 'uri'
 require 'optparse'
 require 'singleton'
 require 'net/http'
+require 'net/https'
 require 'net/smtp'
 require 'pathname'
 require 'logger'
@@ -69,23 +70,23 @@ class Conf
 			end
 		end.parse!
 		
-		$logger.progname = 'wcc'
+		logger.progname = 'wcc'
 
 		# latest flag overrides everything
-		$logger.level = Logger::ERROR
-		$logger.level = Logger::INFO if self[:verbose]
-		$logger.level = Logger::DEBUG if self[:debug]
+		logger.level = Logger::ERROR
+		logger.level = Logger::INFO if self[:verbose]
+		logger.level = Logger::DEBUG if self[:debug]
 
-		$logger.info "No config file given, using default 'conf.yml' file" if ARGV.length == 0
+		logger.info "No config file given, using default 'conf.yml' file" if ARGV.length == 0
 
 		self[:conf] = ARGV[0] || 'conf.yml'
 		
 		if !File.exists?(self[:conf])
-			$logger.fatal "Config file '#{self[:conf]}' does not exist!"
+			logger.fatal "Config file '#{self[:conf]}' does not exist!"
 			exit 1
 		end
 		
-		$logger.debug "Load config from '#{self[:conf]}'"
+		logger.debug "Load config from '#{self[:conf]}'"
 		
 		# may be false if file is empty
 		yaml = YAML.load_file(self[:conf])
@@ -107,7 +108,7 @@ class Conf
 		end
 		
 		if self[:from_mail].to_s.empty?
-			$logger.fatal "No sender mail address given! See help."
+			logger.fatal "No sender mail address given! See help."
 			exit 1
 		end
 		
@@ -122,7 +123,7 @@ class Conf
 		Dir.mkdir(self[:dir]) unless File.directory?(self[:dir])
 		
 		if(self[:clean])
-			$logger.warn "Cleanup hash and diff files"
+			logger.warn "Cleanup hash and diff files"
 			Dir.foreach(self[:dir]) do |f|
 				File.delete(self.file(f)) if f =~ /^.*\.(md5|site)$/
 			end
@@ -137,20 +138,38 @@ class Conf
 		
 		@sites = []
 		
-		$logger.debug "Load sites from '#{Conf[:conf]}'"
+		logger.debug "Load sites from '#{Conf[:conf]}'"
 		
 		# may be false if file is empty
 		yaml = YAML.load_file(Conf[:conf])
 		
 		yaml['sites'].to_a.each do |yaml_site|
+			filterrefs = []
+			(yaml_site['filters'] || []).each do |entry|
+				if entry.is_a?(Hash)
+					# hash containing only one key (filter id),
+					# the value is the argument hash
+					id = entry.keys[0]
+					filterrefs << FilterRef.new(id, entry[id])
+				else entry.is_a?(String)
+					filterrefs << FilterRef.new(entry, {})
+				end
+			end
+			
+			if not yaml_site['cookie'].nil?
+				cookie = File.open(yaml_site['cookie'], 'r') { |f| f.read }
+			end
+			
 			@sites << Site.new(
 				yaml_site['url'], 
 				yaml_site['strip_html'] || false, 
 				yaml_site['emails'].map { |m| MailAddress.new(m) } || [],
-				(yaml_site['filters'] || []).map { |f| f.to_sym })
+				filterrefs,
+				yaml_site['auth'] || {},
+				cookie)
 		end if yaml
 		
-		$logger.debug @sites.length.to_s + (@sites.length == 1 ? ' site' : ' sites') + " loaded\n" +
+		logger.debug @sites.length.to_s + (@sites.length == 1 ? ' site' : ' sites') + " loaded\n" +
 			@sites.map { |s| "  #{s.uri.host.to_s}\n    url: #{s.uri.to_s}\n    id: #{s.id}" }.join("\n")
 		
 		@sites
@@ -172,20 +191,37 @@ class Conf
 	def self.[](key); Conf.instance[key] end
 end
 
+class FilterRef
+	def initialize(id, arguments)
+		@id = id
+		@arguments = arguments
+	end
+	
+	def id; @id end
+	def arguments; @arguments end
+	
+	def to_s; @id end
+end
+
 class Site
-	def initialize(url, strip_html, emails, filters)
+	def initialize(url, strip_html, emails, filters, auth, cookie)
 		@uri = URI.parse(url)
 		@striphtml = strip_html
 		@emails = emails.is_a?(Array) ? emails : [emails]
 		@filters = filters.is_a?(Array) ? filters : [filters]
+		@auth = auth
+		@cookie = cookie
 		@id = Digest::MD5.hexdigest(url.to_s)[0...8]
 		load_hash
 	end
 	
+	# TODO: attr_reader
 	def uri; @uri end
 	def striphtml?; @striphtml end
 	def emails; @emails end
 	def filters; @filters end
+	def auth; @auth end
+	def cookie; @cookie end
 	def id; @id end
 	
 	def to_s; "%s;%s;%s" % [@uri.to_s, (@striphtml ? 'yes' : 'no'), @emails.join(';')] end
@@ -198,10 +234,10 @@ class Site
 	def load_hash
 		file = Conf.file(self.id + '.md5')
 		if File.exists?(file)
-			$logger.debug "Load hash from file '#{file}'"
+			logger.debug "Load hash from file '#{file}'"
 			File.open(file, 'r') { |f| @hash = f.gets; break }
 		else
-			$logger.info "Site #{uri.host} was never checked before."
+			logger.info "Site #{uri.host} was never checked before."
 		end
 	end
 	
@@ -280,7 +316,7 @@ class SmtpMailer
 			end
 		end
 	rescue
-		$logger.fatal "Cannot send mails at #{@host}:#{@port} : #{$!.to_s}"
+		logger.fatal "Cannot send mails at #{@host}:#{@port} : #{$!.to_s}"
 	end
 end
 
@@ -288,15 +324,25 @@ class Filter
 	@@filters = {}
 	
 	def self.add(id, &block)
-		$logger.info "Adding filter '#{id}'"
+		logger.info "Adding filter '#{id}'"
 		@@filters[id] = block
 	end
 	
 	def self.accept(data, filters)
-		$logger.info "Testing with filters: #{filters.join(', ')}"
-		@@filters.select { |id,block| filters.include?(id) }.each do |id,block|
-			if not block.call(data):
-				$logger.info "Filter #{id} failed!"
+		return true if filters.nil?
+		
+		logger.info "Testing with filters: #{filters.join(', ')}"
+		
+		filters.each do |filterref|
+			block = @@filters[filterref.id]
+			
+			if block.nil?
+				logger.error "Requested filter '#{filterref.id}' not found, skipping it."
+				next
+			end
+			
+			if not block.call(data, filterref.arguments)
+				logger.info "Filter #{filterref.id} failed!"
 				return false
 			end
 		end
@@ -312,42 +358,66 @@ class String
 	end
 end
 
+def fetch(site)
+	http = Net::HTTP.new(site.uri.host, site.uri.port)
+	if site.uri.is_a?(URI::HTTPS)
+		http.use_ssl = true
+		http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+	end
+	http.start do |http|
+		req = Net::HTTP::Get.new(site.uri.request_uri)
+		if site.auth['type'] == 'basic'
+			logger.debug "Doing basic auth"
+			req.basic_auth(site.auth['username'], site.auth['password'])
+		end
+		if not site.cookie.nil?
+			req.add_field("Cookie", site.cookie)
+		end
+		http.request(req)
+	end
+end
+
 def checkForUpdate(site)
-	$logger.info "Requesting '#{site.uri.to_s}'"
+	logger.info "Requesting '#{site.uri.to_s}'"
 	begin
-		res = Net::HTTP.get_response(site.uri)
-	rescue
-		$logger.error "Cannot connect to '#{site.uri.to_s}': #{$!.to_s}"
+		res = fetch(site)
+	rescue => ex
+		logger.error "Cannot connect to #{site.uri.to_s} : #{ex.to_s}"
 		return false
 	end
 	if not res.kind_of?(Net::HTTPOK)
-		$logger.warn "Site #{site.uri.to_s} returned #{res.code} code, skipping it."
+		logger.error "Site #{site.uri.to_s} returned #{res.code} code, skipping it."
 		return false
 	end
 	
-	new_site = res.body
+	new_content = res.body
 	
 	# detect encoding from http header, meta element, default utf-8
 	# do not use utf-8 regex because it will fail on non utf-8 pages
 	encoding = (res['content-type'].to_s.match(/;\s*charset=([A-Za-z0-9-]*)/i).to_a[1] || 
-				new_site.match(/<meta.*charset=([a-zA-Z0-9-]*).*/i).to_a[1]).to_s.downcase || 'utf-8'
+				new_content.match(/<meta.*charset=([a-zA-Z0-9-]*).*/i).to_a[1]).to_s.downcase || 'utf-8'
 	
-	$logger.info "Encoding is '#{encoding}'"
+	logger.info "Encoding is '#{encoding}'"
 	
 	# convert to utf-8
-	new_site = Iconv.conv('utf-8', encoding, new_site)
+	begin
+		new_content = Iconv.conv('utf-8', encoding, new_content)
+	rescue
+		logger.error "Cannot convert site from '#{encoding}': #{$!.to_s}"
+		return false
+	end
 	
 	# strip html _before_ diffing
-	new_site = new_site.strip_html if site.striphtml?
-	new_hash = Digest::MD5.hexdigest(new_site)
+	new_content = new_content.strip_html if site.striphtml?
+	new_hash = Digest::MD5.hexdigest(new_content)
 	
-	$logger.debug "Compare hashes\n  old: #{site.hash.to_s}\n  new: #{new_hash.to_s}"
+	logger.debug "Compare hashes\n  old: #{site.hash.to_s}\n  new: #{new_hash.to_s}"
 	return false if new_hash == site.hash
 	
 	# do not try diff or anything if site was never checked before
 	if site.new?
 		# update content
-		site.hash, site.content = new_hash, new_site
+		site.hash, site.content = new_hash, new_content
 		
 		# set custom diff message
 		diff = "Site was first checked so no diff was possible."
@@ -362,7 +432,7 @@ def checkForUpdate(site)
 		new_label = "NEW (%s)" % Time.now.strftime(DIFF_TIME_FMT)
 	
 		# do update
-		site.hash, site.content = new_hash, new_site
+		site.hash, site.content = new_hash, new_content
 		
 		# diff between OLD and NEW
 		diff = %x[diff -U 1 --label "#{old_label}" --label "#{new_label}" #{old_site_file.path} #{Conf.file(site.id + '.site')}]
@@ -386,6 +456,9 @@ class MyFormatter
 	end
 end
 
+# get logger of this program
+def logger; $logger end
+
 # create global logger
 $logger = Logger.new(STDOUT)
 $logger.formatter = MyFormatter.new
@@ -394,8 +467,8 @@ $logger.formatter = MyFormatter.new
 
 Conf.sites.each do |site|
 	if checkForUpdate(site)
-		$logger.warn "#{site.uri.host.to_s} has an update!"
+		logger.warn "#{site.uri.host.to_s} has an update!"
 	else
-		$logger.info "#{site.uri.host.to_s} is unchanged"
+		logger.info "#{site.uri.host.to_s} is unchanged"
 	end
 end
